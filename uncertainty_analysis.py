@@ -23,12 +23,14 @@ from gurobipy import GRB
 
 from robust_traffic_control import (
     TrafficParams, GridParams, RobustTrafficController, SolverResult,
-    paper_default_ic,
+    paper_default_ic, paper_milp_ic,
 )
 
-# ── Default scenario (fits within Gurobi licence limits) ─────────────────────
+# ── Default scenario — paper Section IV.C (fits within Gurobi licence limits) ─
+# N=10, X=300m, ΔT=30s=1/120 h → alpha=1.667 (LP does not require CFL≤1)
+# K=12 is max feasible (paper uses K=30 which needs 9149 constraints > 2000)
 DEFAULT_TP  = TrafficParams(v_f=60.0, w=15.0, rho_max=150.0)
-DEFAULT_GRD = GridParams(L=10.0, T=0.2, N=10, K=12)  # T=12 min, CFL=1
+DEFAULT_GRD = GridParams(L=10 * 0.3, T=12 / 120.0, N=10, K=12)
 
 
 # =============================================================================
@@ -79,10 +81,11 @@ def sweep_uncertainty(
     rob_n_cong     = np.zeros(n, dtype=int)
     rob_solve_time = np.zeros(n)
 
-    # Solve optimal LP once (reference)
-    r_opt = ctrl.solve_optimal(rho_0, verbose=False)
-    opt_obj_ref   = -r_opt.obj_value
-    opt_ncong_ref = int(np.sum(r_opt.rho[-1] > tp.rho_c))
+    # Reference: MILP with nominal IC (δ=0) — same objective as robust
+    # (Using solve_optimal's LP would give an incomparable objective value.)
+    r_nom = ctrl.solve_robust(rho_0, delta=0.0, verbose=False)
+    opt_obj_ref   = -r_nom.obj_value
+    opt_ncong_ref = int(np.sum(r_nom.b_cong)) if r_nom.b_cong is not None else 0
 
     for i, delta in enumerate(deltas):
         opt_obj[i]    = opt_obj_ref
@@ -145,10 +148,12 @@ def simulate_extreme_scenarios(
         print(f'  Solving robust MILP (δ = {delta*100:.0f}%) …')
     rob_nominal = ctrl.solve_robust(rho_0, delta=delta, verbose=False)
 
+    # Upper-bound IC: cap densities at ρ_max (physical limit)
+    rho_upper = np.minimum(rho_0 * (1.0 + delta), tp.rho_max)
     if verbose:
         print('  Forward-simulating upper-bound IC …')
     sim_upper = _simulate_fixed_control(
-        rho_0 * (1.0 + delta), rob_nominal.q_in, rob_nominal.q_out, tp, grd)
+        rho_upper, rob_nominal.q_in, rob_nominal.q_out, tp, grd)
 
     if verbose:
         print('  Forward-simulating lower-bound IC …')

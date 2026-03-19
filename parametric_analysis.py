@@ -24,7 +24,7 @@ import numpy as np
 
 from robust_traffic_control import (
     TrafficParams, GridParams, RobustTrafficController,
-    paper_default_ic, count_constraints,
+    paper_milp_ic, paper_default_ic, count_constraints,
 )
 
 DELTA_ROB = 0.10    # 10 % uncertainty for the robust run
@@ -38,17 +38,20 @@ def _sweep(tp_list, grd_list, rho_list,
            delta: float = DELTA_ROB,
            verbose: bool = False) -> Dict[str, np.ndarray]:
     """
-    Run one LP + one MILP solve per (tp, grd, rho_0) triple.
+    Run one nominal MILP (δ=0) + one robust MILP (δ=delta) solve per triple.
+
+    Using the same MILP objective for both "nominal" and "robust" makes the
+    conservatism gap directly interpretable as the cost of robustness.
 
     Returns
     -------
     dict with keys:
-        'opt_flows'  – negated LP objective   (higher = better)
-        'rob_flows'  – negated MILP objective
-        'opt_times'  – LP solve time [s]
-        'rob_times'  – MILP solve time [s]
-        'opt_n_cong' – congested cells at t=T (optimal, from density)
-        'rob_n_cong' – congested cells at t=T (robust, from b_cong)
+        'opt_flows'  – negated nominal MILP objective   (higher = better)
+        'rob_flows'  – negated robust MILP objective
+        'opt_times'  – nominal MILP solve time [s]
+        'rob_times'  – robust MILP solve time [s]
+        'opt_n_cong' – congested cells at t=T (nominal, from b_cong)
+        'rob_n_cong' – congested cells at t=T (robust,  from b_cong)
     """
     n = len(tp_list)
     opt_flows  = np.full(n, np.nan)
@@ -71,12 +74,12 @@ def _sweep(tp_list, grd_list, rho_list,
             continue
 
         try:
-            r_opt = ctrl.solve_optimal(rho_0, verbose=False)
+            r_opt = ctrl.solve_robust(rho_0, delta=0.0, verbose=False)
             opt_flows[i]  = -r_opt.obj_value
             opt_times[i]  = r_opt.solve_time
-            opt_n_cong[i] = int(np.sum(r_opt.rho[-1] > tp.rho_c))
+            opt_n_cong[i] = int(np.sum(r_opt.b_cong))
         except Exception as e:
-            warnings.warn(f'Optimal solve {i} failed: {e}')
+            warnings.warn(f'Nominal MILP solve {i} failed: {e}')
 
         try:
             r_rob = ctrl.solve_robust(rho_0, delta=delta, verbose=False)
@@ -201,11 +204,13 @@ def sweep_initial_density(
         delta: float = DELTA_ROB,
         verbose: bool = True) -> Tuple[np.ndarray, Dict]:
     """
-    Vary the initial density as a fraction of ρ_max (uniform profile).
+    Vary the initial density as a uniform fraction of ρ_max.
+    Uses the paper's MILP grid: N=10, X=300m, K=12, ΔT=30s.
     """
     print('Parametric study: Initial density level')
+    # Paper MILP grid: N=10, X=300m → L=3km, ΔT=30s=1/120h, K=12
     tp_ref  = TrafficParams()
-    grd_ref = GridParams(L=10.0, T=0.2, N=10, K=12)  # default safe grid
+    grd_ref = GridParams(L=10 * 0.3, T=12 / 120.0, N=10, K=12)
     tp_list, grd_list, rho_list = [], [], []
 
     for frac in rho_fracs:

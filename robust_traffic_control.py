@@ -33,18 +33,36 @@ characteristic speed v = (x₂−x₁)/dt ∈ [−w, v_f]:
 
 where  ρ_c = w·ρ_max/(v_f+w)  and  q_max = v_f·ρ_c.
 
-The unified formula  dt·H*(v) = dt·q_max − (x₂−x₁)·ρ_c  comes from the
-Legendre-Fenchel transform H*(v) = (v_f − v)·ρ_c  of the Hamiltonian.
+The unified formula  dt·φ*(v) = dt·q_max − (x₂−x₁)·ρ_c  comes from the
+Legendre-Fenchel transform φ*(v) = (v_f − v)·ρ_c  of the Hamiltonian
+(valid for v ∈ [−w, v_f]; φ*(v) = +∞ outside this range).
 
 Three condition types are encoded as linear upper-bound constraints:
   (a) Initial conditions (IC):   source at (0, j·Δx), j = 0…N
   (b) Upstream boundary (UP BC): source at (m·Δt, 0), m = 0…K−1
   (c) Downstream boundary (DN BC): source at (m·Δt, L), m = 0…K−1
 
+LP objective — paper equation (6), Section III.B
+-------------------------------------------------
+Maximise cumulative downstream flow (no time weights, no upstream term):
+
+    min  −Σ_{t=1}^{n_max}  q_out(t)
+
+MILP objective — paper Section IV.B
+-------------------------------------
+Maximise weighted total boundary flow, penalise final-time congestion:
+
+    min  −Σ_{t=1}^{n_max} w(t)·[q_out(t) + q_in(t)]  +  Σ_{i=1}^{N} b_cong(i)
+
+where  w(t) = exp(5·(n_max − t) / n_max)  (heavier weight on early steps).
+Upstream flows are added to obtain a more visible conservatism gap between
+the robust and the nominal solutions (paper Section IV.B, last paragraph).
+
 Robust formulation
 ------------------
-Uncertainty: ρ₀[i] ∈ [ρ₀_nom[i]·(1−δ),  ρ₀_nom[i]·(1+δ)].
-The robust controller uses worst-case (lower-bound) Moskowitz IC values.
+Uncertainty: ρ₀[i] ∈ [ρ₀_nom[i]·(1−δ),  min(ρ₀_nom[i]·(1+δ), ρ_max)].
+The robust controller uses worst-case (lower-bound) Moskowitz IC values in
+ALL equality and Lax-Hopf constraints simultaneously (paper Section IV.B).
 Binary congestion indicators b_cong[i] convert the LP to a MILP.
 
 License note
@@ -304,9 +322,9 @@ class RobustTrafficController:
         """
         Solve the **optimal** boundary-control LP (no uncertainty, no binaries).
 
-        Objective: maximise Σ w(m)·[q_out(m) + q_in(m)], where
-        w(m) = exp(5·(K−1−m)/K) is a time-decaying weight (heavier weight
-        on early time steps encourages swift congestion clearance).
+        Objective: paper equation (6), Section III.B —
+          Minimise −Σ_{t=1}^{n_max} q_out(t)
+        Maximise cumulative downstream flow; no time weights, no q_in term.
 
         Parameters
         ----------
@@ -497,22 +515,30 @@ class RobustTrafficController:
                     name=f'cong_{i}')
 
         # ── Objective function ─────────────────────────────────────────────
-        # Time-decaying weight: w(m) = exp(5·(K−1−m)/K)
-        # (heavier weight on early time steps, consistent with paper)
+        # Time-decaying weight (MILP only, paper Section IV.B):
+        #   w(t) = exp(5·(n_max − t) / n_max)   for t = 1 … n_max
+        # In 0-based indexing (m = 0 … K-1  corresponds to t = 1 … K):
+        #   weights[m] = exp(5·(K − 1 − m) / K)
+        # → w[0] = exp(5·(K-1)/K) ≈ e^5 (heaviest, first time step)
+        # → w[K-1] = exp(0) = 1             (lightest, last time step)
         weights = np.exp(5.0 * np.arange(K - 1, -1, -1) / K)
 
         if robust:
-            # MILP objective (paper eq. 10):
-            # min −Σ_m w(m)·[q_out(m)+q_in(m)]  +  Σ_i b_cong(i)
+            # MILP objective — paper Section IV.B:
+            #   f(y_c) = −Σ_{t=1}^{n_max} w(t)·[q_out(t)+q_in(t)]  +  Σ_{i=1}^{N} b_cong(i)
+            #   w(t) = exp(5·(n_max − t) / n_max)   [heaviest weight on earliest step]
+            # Upstream flows are included to obtain a more visible difference
+            # between robust and optimal solutions (paper text, Section IV.B).
             obj = (
                 -gp.quicksum(weights[m] * (q_out_v[m] + q_in_v[m])
                              for m in range(K))
                 + gp.quicksum(b_cong_v[i] for i in range(N))
             )
         else:
-            # LP objective: min −Σ_m w(m)·[q_out(m)+q_in(m)]
-            obj = -gp.quicksum(weights[m] * (q_out_v[m] + q_in_v[m])
-                               for m in range(K))
+            # LP objective — paper equation (6), Section III.B:
+            #   Minimize −Σ_{i=1}^{n_max} q_out(i)
+            # Maximise cumulative downstream flow; no time weights, no q_in.
+            obj = -gp.quicksum(q_out_v[m] for m in range(K))
 
         model.setObjective(obj, GRB.MINIMIZE)
         model.update()
@@ -587,19 +613,45 @@ def make_piecewise_ic(segments: list,
     return rho_0
 
 
+def paper_milp_ic(tp: TrafficParams, grd: GridParams) -> np.ndarray:
+    """
+    Exact initial density for the robust MILP example — paper Section IV.C.
+
+    The paper states:
+      ρ_meas = [3, 5, 2, 8, 6, 9, 10, 7, 1, 4] × 0.5·ρ_c
+    for 10 segments of equal length X = 300 m.
+
+    For other N values the vector is resampled by nearest-neighbour interpolation.
+    """
+    rho_paper = np.array([3, 5, 2, 8, 6, 9, 10, 7, 1, 4], dtype=float) * 0.5 * tp.rho_c
+    if grd.N == 10:
+        return np.minimum(rho_paper, tp.rho_max)
+    # Resample: map 10 paper cells onto grd.N cells
+    idx = np.round(np.linspace(0, 9, grd.N)).astype(int)
+    return np.minimum(rho_paper[idx], tp.rho_max)
+
+
+def paper_lp_ic(tp: TrafficParams, grd: GridParams) -> np.ndarray:
+    """
+    Initial density for the optimal-LP example — paper Section III.C.
+
+    The paper describes a 6-segment piecewise-constant profile with values
+    in the range [0.5·ρ_c, 3·ρ_c] representing a partly congested link.
+    For N ≠ 6 the profile is resampled by nearest-neighbour interpolation.
+    """
+    # Representative partly-congested IC in [0.5ρ_c, 3ρ_c]
+    rho_paper = np.array([3, 5, 2, 4, 3, 5], dtype=float) * 0.5 * tp.rho_c
+    if grd.N == 6:
+        return rho_paper
+    idx = np.round(np.linspace(0, 5, grd.N)).astype(int)
+    return rho_paper[idx]
+
+
 def paper_default_ic(tp: TrafficParams, grd: GridParams) -> np.ndarray:
     """
-    Six-segment piecewise-constant initial density as used in Figure 1 of
-    the paper (partially congested highway).
+    Default initial density (alias for the MILP example IC — paper Section IV.C).
+
+    For N=10 returns the exact paper values; otherwise resamples.
+    See :func:`paper_milp_ic` for details.
     """
-    L = grd.L
-    # Alternating congested / free-flow / congested segments
-    segs = [
-        (0.00 * L, 0.20 * L, 0.80),   # heavily congested  (120 veh/km)
-        (0.20 * L, 0.35 * L, 0.45),   # near critical
-        (0.35 * L, 0.55 * L, 0.15),   # free-flow
-        (0.55 * L, 0.70 * L, 0.72),   # congested
-        (0.70 * L, 0.85 * L, 0.30),   # light traffic
-        (0.85 * L, 1.00 * L, 0.55),   # moderately congested
-    ]
-    return make_piecewise_ic(segs, tp, grd)
+    return paper_milp_ic(tp, grd)
