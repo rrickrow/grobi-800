@@ -1,0 +1,23 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Generated figures (re-created by running main.py)
+figures/
+
+# Gurobi log files
+gurobi.log
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
